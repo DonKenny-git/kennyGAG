@@ -1,0 +1,146 @@
+<roblox version="4">
+	<Item class="LocalScript" referent="RBX0">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">GiftTestUI</string>
+			<ProtectedString name="Source"><![CDATA[
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local localPlayer = Players.LocalPlayer
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local giftFunction = remotes:WaitForChild("GiftPet")
+local getInventoryFunction = remotes:WaitForChild("GetInventory")
+local spawnTestPetFunction = remotes:WaitForChild("SpawnTestPet")
+
+local function getInventory()
+	local ok, result = pcall(function()
+		return getInventoryFunction:InvokeServer()
+	end)
+	if ok and result and result.ok then
+		return result.inventory
+	end
+	return {}
+end
+
+local function firstKey(map)
+	for k in pairs(map) do
+		return k
+	end
+	return nil
+end
+
+local gui = Instance.new("ScreenGui")
+localPlayer:WaitForChild("PlayerGui")
+gui.Name = "GiftTestUI"
+gui.ResetOnSpawn = false
+
+gui.Parent = localPlayer.PlayerGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 400, 0, 200)
+frame.Position = UDim2.new(0, 20, 0, 20)
+frame.BackgroundTransparency = 0.2
+frame.Parent = gui
+
+local recipientBox = Instance.new("TextBox")
+recipientBox.Size = UDim2.new(0, 220, 0, 32)
+recipientBox.Position = UDim2.new(0, 10, 0, 10)
+recipientBox.PlaceholderText = "Recipient username"
+recipientBox.Text = ""
+recipientBox.ClearTextOnFocus = false
+recipientBox.Parent = frame
+
+local addBtn = Instance.new("TextButton")
+addBtn.Size = UDim2.new(0, 150, 0, 32)
+addBtn.Position = UDim2.new(0, 10, 0, 50)
+addBtn.Text = "+ Add Pet"
+addBtn.Parent = frame
+
+local giftBtn = Instance.new("TextButton")
+(giftBtn).Size = UDim2.new(0, 150, 0, 32)
+(giftBtn).Position = UDim2.new(0, 170, 0, 50)
+(giftBtn).Text = "Gift First Pet"
+(giftBtn).Parent = frame
+
+local refreshBtn = Instance.new("TextButton")
+refreshBtn.Size = UDim2.new(0, 110, 0, 28)
+refreshBtn.Position = UDim2.new(0, 330, 0, 12)
+refreshBtn.Text = "Refresh"
+refreshBtn.Parent = frame
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(0, 380, 0, 20)
+status.Position = UDim2.new(0, 10, 0, 90)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.BackgroundTransparency = 1
+status.Text = ""
+status.Parent = frame
+
+local invLabel = Instance.new("TextLabel")
+invLabel.Size = UDim2.new(0, 380, 0, 90)
+invLabel.Position = UDim2.new(0, 10, 0, 115)
+invLabel.TextXAlignment = Enum.TextXAlignment.Left
+invLabel.TextYAlignment = Enum.TextYAlignment.Top
+invLabel.TextWrapped = true
+invLabel.BackgroundTransparency = 1
+invLabel.Text = ""
+invLabel.Parent = frame
+
+local function refresh()
+	local inventory = getInventory()
+	local lines = {}
+	for id, data in pairs(inventory) do
+		lines[#lines+1] = string.format("%s | %s L%s P%s", string.sub(id,1,6), tostring(data.species), tostring(data.level), tostring(data.power))
+	end
+	invLabel.Text = (#lines > 0) and table.concat(lines, "\n") or "(Inventory empty)"
+end
+
+local function findRecipientUserIdByName(name)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= localPlayer and string.lower(p.Name) == string.lower(name) then
+			return p.UserId
+		end
+	end
+	return nil
+end
+
+addBtn.MouseButton1Click:Connect(function()
+	local result = spawnTestPetFunction:InvokeServer()
+	if result and result.ok then
+		status.Text = "Added pet " .. string.sub(result.id, 1, 6)
+	else
+		status.Text = "Add failed"
+	end
+	refresh()
+end)
+
+giftBtn.MouseButton1Click:Connect(function()
+	local inventory = getInventory()
+	local petId = firstKey(inventory)
+	if not petId then
+		status.Text = "No pet to gift"
+		return
+	end
+	local name = recipientBox.Text
+	if not name or name == "" then
+		status.Text = "Enter recipient"
+		return
+	end
+	local uid = findRecipientUserIdByName(name)
+	if not uid then
+		status.Text = "Recipient not found"
+		return
+	end
+	local result = giftFunction:InvokeServer(uid, petId)
+	status.Text = result and (result.message or (result.ok and "Success" or "Failed")) or "No response"
+	refresh()
+end)
+
+refreshBtn.MouseButton1Click:Connect(refresh)
+
+refresh()
+			]]></ProtectedString>
+		</Properties>
+	</Item>
+</roblox> 

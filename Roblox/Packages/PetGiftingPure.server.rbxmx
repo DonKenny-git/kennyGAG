@@ -1,0 +1,270 @@
+<roblox version="4">
+	<Item class="Script" referent="RBX0">
+		<Properties>
+			<bool name="Disabled">false</bool>
+			<string name="Name">PetGiftingPure</string>
+			<ProtectedString name="Source"><![CDATA[
+-- PetGiftingPure.server.lua
+-- Single-file server script: inventory + gifting + minimal persistence
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
+local HttpService = game:GetService("HttpService")
+
+-- Config
+local INVENTORY_DATASTORE_NAME = "PetInventory_v1"
+local AUTOSAVE_INTERVAL_SECONDS = 60
+local GIFT_COOLDOWN_SECONDS = 1.5
+local TRANSACTION_TTL_SECONDS = 10
+local DUPLICATE_ON_GIFT = true -- set to false to transfer instead of duplicate
+
+-- Internal state
+local inventoryStore = DataStoreService:GetDataStore(INVENTORY_DATASTORE_NAME)
+local userIdToInventoryMap = {}
+local userIdDirty = {}
+local lastGiftAtSeconds = {}
+local recentTransactions = {}
+
+-- Helpers
+local function deepCopy(value)
+	if typeof(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, child in pairs(value) do
+		copy[key] = deepCopy(child)
+	end
+	return copy
+end
+
+local function generatePetId()
+	return HttpService:GenerateGUID(false)
+end
+
+local function getInventoryMap(userId)
+	if not userIdToInventoryMap[userId] then
+		userIdToInventoryMap[userId] = {}
+	end
+	return userIdToInventoryMap[userId]
+end
+
+local function markDirty(userId)
+	userIdDirty[userId] = true
+end
+
+local function encodeInventoryForStore(inventoryMap)
+	local petsArray = {}
+	for id, data in pairs(inventoryMap) do
+		local clean = deepCopy(data)
+		clean.id = id
+		table.insert(petsArray, clean)
+	end
+	return petsArray
+end
+
+local function decodeInventoryFromStore(petsArray)
+	local inventoryMap = {}
+	if typeof(petsArray) == "table" then
+		for _, data in ipairs(petsArray) do
+			if typeof(data) == "table" and typeof(data.id) == "string" then
+				inventoryMap[data.id] = data
+			end
+		end
+	end
+	return inventoryMap
+end
+
+local function addPet(userId, petData)
+	local inventoryMap = getInventoryMap(userId)
+	local id = petData.id or generatePetId()
+	local toInsert = deepCopy(petData)
+	toInsert.id = id
+	inventoryMap[id] = toInsert
+	markDirty(userId)
+	return id
+end
+
+local function getPet(userId, petId)
+	return getInventoryMap(userId)[petId]
+end
+
+local function clonePetData(petData)
+	local cloned = deepCopy(petData)
+	cloned.id = generatePetId()
+	return cloned
+end
+
+local function saveForUserId(userId)
+	local inventoryMap = getInventoryMap(userId)
+	local encoded = encodeInventoryForStore(inventoryMap)
+	local ok = pcall(function()
+		inventoryStore:SetAsync(tostring(userId), encoded)
+	end)
+	if ok then
+		userIdDirty[userId] = false
+	end
+	return ok
+end
+
+local function loadForUserId(userId)
+	local ok, result = pcall(function()
+		return inventoryStore:GetAsync(tostring(userId))
+	end)
+	if ok and result then
+		userIdToInventoryMap[userId] = decodeInventoryFromStore(result)
+	else
+		userIdToInventoryMap[userId] = userIdToInventoryMap[userId] or {}
+	end
+	userIdDirty[userId] = false
+end
+
+-- Autosave loop
+spawn(function()
+	while true do
+		local startTime = os.clock()
+		for _, player in ipairs(Players:GetPlayers()) do
+			local userId = player.UserId
+			if userIdDirty[userId] then
+				pcall(function()
+					saveForUserId(userId)
+				end)
+			end
+		end
+		local elapsed = os.clock() - startTime
+		local waitTime = math.max(0, AUTOSAVE_INTERVAL_SECONDS - elapsed)
+		task.wait(waitTime)
+	end
+end)
+
+-- Remote setup
+local remotesFolder = ReplicatedStorage:FindFirstChild("Remotes") or Instance.new("Folder")
+remotesFolder.Name = "Remotes"
+remotesFolder.Parent = ReplicatedStorage
+
+local giftFunction = remotesFolder:FindFirstChild("GiftPet") or Instance.new("RemoteFunction")
+giftFunction.Name = "GiftPet"
+giftFunction.Parent = remotesFolder
+
+local getInventoryFunction = remotesFolder:FindFirstChild("GetInventory") or Instance.new("RemoteFunction")
+getInventoryFunction.Name = "GetInventory"
+getInventoryFunction.Parent = remotesFolder
+
+local spawnTestPetFunction = remotesFolder:FindFirstChild("SpawnTestPet") or Instance.new("RemoteFunction")
+spawnTestPetFunction.Name = "SpawnTestPet"
+spawnTestPetFunction.Parent = remotesFolder
+
+-- Player lifecycle
+Players.PlayerAdded:Connect(function(player)
+	loadForUserId(player.UserId)
+	local inv = getInventoryMap(player.UserId)
+	if next(inv) == nil then
+		addPet(player.UserId, { species = "Starter", level = 1, power = 5 })
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	lastGiftAtSeconds[player.UserId] = nil
+	pcall(function()
+		saveForUserId(player.UserId)
+	end)
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		pcall(function()
+			saveForUserId(player.UserId)
+		end)
+	end
+end)
+
+-- Gifting
+local function purgeExpiredTransactions()
+	local now = os.clock()
+	for key, expiry in pairs(recentTransactions) do
+		if expiry <= now then
+			recentTransactions[key] = nil
+		end
+	end
+end
+
+local function makeTxKey(senderUserId, recipientUserId, petId)
+	return string.format("%d>%d#%s", senderUserId, recipientUserId, petId)
+end
+
+giftFunction.OnServerInvoke = function(senderPlayer, recipientUserId, petId)
+	purgeExpiredTransactions()
+
+	if typeof(recipientUserId) ~= "number" or typeof(petId) ~= "string" then
+		return { ok = false, message = "Invalid arguments" }
+	end
+	if recipientUserId == senderPlayer.UserId then
+		return { ok = false, message = "Cannot gift to yourself" }
+	end
+	local recipientPlayer = Players:GetPlayerByUserId(recipientUserId)
+	if not recipientPlayer then
+		return { ok = false, message = "Recipient is not online" }
+	end
+
+	local now = os.clock()
+	local last = lastGiftAtSeconds[senderPlayer.UserId]
+	if last and (now - last) < GIFT_COOLDOWN_SECONDS then
+		return { ok = false, message = "Please wait before gifting again" }
+	end
+	lastGiftAtSeconds[senderPlayer.UserId] = now
+
+	local senderPet = getPet(senderPlayer.UserId, petId)
+	if not senderPet then
+		return { ok = false, message = "Pet not found" }
+	end
+
+	local txKey = makeTxKey(senderPlayer.UserId, recipientUserId, petId)
+	if recentTransactions[txKey] then
+		return { ok = false, message = "Duplicate request blocked" }
+	end
+	recentTransactions[txKey] = now + TRANSACTION_TTL_SECONDS
+
+	if DUPLICATE_ON_GIFT then
+		local cloned = clonePetData(senderPet)
+		addPet(recipientUserId, cloned)
+	else
+		local senderInv = getInventoryMap(senderPlayer.UserId)
+		senderInv[petId] = nil
+		addPet(recipientUserId, senderPet)
+	end
+
+	return { ok = true, message = "Gift delivered" }
+end
+
+-- Inventory fetch (self only)
+getInventoryFunction.OnServerInvoke = function(requestingPlayer, targetUserId)
+	local userId = targetUserId or requestingPlayer.UserId
+	if userId ~= requestingPlayer.UserId then
+		return { ok = false, inventory = nil }
+	end
+	local summary = {}
+	for id, data in pairs(getInventoryMap(userId)) do
+		summary[id] = {
+			id = id,
+			species = data.species,
+			level = data.level,
+			power = data.power,
+		}
+	end
+	return { ok = true, inventory = summary }
+end
+
+-- Test helper: add a pet
+spawnTestPetFunction.OnServerInvoke = function(requestingPlayer)
+	local userId = requestingPlayer.UserId
+	local speciesPool = { "Dog", "Cat", "Bunny", "Fox", "Dragon" }
+	local species = speciesPool[Random.new():NextInteger(1, #speciesPool)]
+	local level = Random.new():NextInteger(1, 10)
+	local power = Random.new():NextInteger(5, 100)
+	local id = addPet(userId, { species = species, level = level, power = power })
+	return { ok = true, id = id }
+end
+			]]></ProtectedString>
+		</Properties>
+	</Item>
+</roblox> 
